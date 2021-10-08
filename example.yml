@@ -1,0 +1,133 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Parameters:
+  Token:
+    Type: String
+
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: sns-confirm-subscription-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:ConfirmSubscription
+                  - sns:ListSubscriptionsByTopic
+                Resource: !Ref SNSTopic
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+
+  Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import urllib3
+
+          http = urllib3.PoolManager()
+          SUCCESS = 'SUCCESS'
+          FAILED = 'FAILED'
+
+          def send(event, context, responseStatus, responseData, physicalResourceId=None, noEcho=False):
+              responseUrl = event['ResponseURL']
+
+              print(responseUrl)
+
+              responseBody = {}
+              responseBody['Status'] = responseStatus
+              responseBody['Reason'] = 'See the details in CloudWatch Log Stream: ' + context.log_stream_name
+              responseBody['PhysicalResourceId'] = physicalResourceId or context.log_stream_name
+              responseBody['StackId'] = event['StackId']
+              responseBody['RequestId'] = event['RequestId']
+              responseBody['LogicalResourceId'] = event['LogicalResourceId']
+              responseBody['NoEcho'] = noEcho
+              responseBody['Data'] = responseData
+
+              json_responseBody = json.dumps(responseBody)
+
+              print('Response body:\n' + json_responseBody)
+
+              headers = {
+                  'content-type' : '',
+                  'content-length' : str(len(json_responseBody))
+              }
+
+              try:
+                  response = http.request('PUT',responseUrl,body=json_responseBody.encode('utf-8'),headers=headers)
+                  print('Status code: ' + response.reason)
+              except Exception as e:
+                  print('send(..) failed executing requests.put(..): ' + str(e))
+
+          def handler(event, context):
+            try:
+              # print(event)
+              params = dict([(k, v) for k, v in event['ResourceProperties'].items() if k != 'ServiceToken'])
+              # print(params)
+
+              if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                print(event['RequestType'])
+
+                if event['RequestType'] == 'Update':
+                  # get subscription status
+                  client = boto3.client('sns')
+                  response = client.list_subscriptions_by_topic(
+                    TopicArn=params['TopicArn']
+                  )
+                  SubscriptionArn = [x for x in response['Subscriptions'] if x['TopicArn'] == params['TopicArn']][0]['SubscriptionArn']
+
+                  if params['Token'] and SubscriptionArn == 'PendingConfirmation':
+                    # Confirm a pending subscription
+                    print('Confirm a pending subscription')
+                    response = client.confirm_subscription(
+                      TopicArn=params['TopicArn'],
+                      Token=params['Token'],
+                      AuthenticateOnUnsubscribe='true'
+                    )
+
+              if event['RequestType'] == 'Delete':
+                # Write the processing at the time of 'Delete' here
+                print(event['RequestType'])
+
+              response_data = {}
+              send(event, context, SUCCESS, response_data)
+            except Exception as e:
+              print('Exception: ' + str(e))
+              send(event, context, FAILED, {})
+
+      Handler: index.handler
+      Runtime: python3.9
+      Timeout: 30
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+  CustomResource:
+    Type: Custom::CustomResource
+    Properties:
+      ServiceToken: !GetAtt Function.Arn
+      TopicArn: !Ref SNSTopic
+      Token: !Ref Token
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+
+  SNSTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: notification@example.com
+      Protocol: email
+      TopicArn: !Ref SNSTopic
